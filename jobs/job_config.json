@@ -1,0 +1,38 @@
+resources:
+  jobs:
+    energy_market_pipeline_job:
+      name: energy_market_pipeline_job
+      schedule:
+        quartz_cron_expression: 55 0 10 * * ?
+        timezone_id: Australia/Sydney
+        pause_status: PAUSED
+      tasks:
+        - task_key: bronze_ingestion
+          notebook_task:
+            notebook_path: /Workspace/Users/vtilakumara@academic.mit.edu.au/01_ingest_bronze_price_and_demand
+            source: WORKSPACE
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          retry_on_timeout: true
+          disable_auto_optimization: false
+        - task_key: silver_transformation
+          depends_on:
+            - task_key: bronze_ingestion
+          notebook_task:
+            notebook_path: /Workspace/Users/vtilakumara@academic.mit.edu.au/01_silver_price_and_demand
+            source: WORKSPACE
+          max_retries: 1
+          min_retry_interval_millis: 300000
+          disable_auto_optimization: false
+        - task_key: gold_analytics
+          depends_on:
+            - task_key: silver_transformation
+          notebook_task:
+            notebook_path: /Workspace/Users/vtilakumara@academic.mit.edu.au/01_gold_price_and_demand
+            source: WORKSPACE
+          max_retries: 1
+          min_retry_interval_millis: 120000
+          disable_auto_optimization: false
+      queue:
+        enabled: true
+      performance_target: PERFORMANCE_OPTIMIZED
