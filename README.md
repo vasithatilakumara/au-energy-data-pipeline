@@ -284,47 +284,6 @@ The pipeline supports:
 
 ---
 
-# 12. Next Steps (Planned)
-
-The next stage of the pipeline will implement the **Silver layer**.
-
-Silver transformations will:
-
-```
-bronze.price_and_demand
-        ↓
-parse settlement timestamp
-        ↓
-derive time attributes
-        ↓
-data validation
-        ↓
-silver.price_and_demand
-```
-
-Future Gold analytics will include:
-
-- demand trend analysis
-- price spike detection
-- peak demand identification
-- battery dispatch recommendations
-
----
-
-# 13. Certification Concepts Covered
-
-This project already demonstrates several key Databricks Data Engineer topics.
-
-| Exam Topic                  | Implementation                  |
-| --------------------------- | ------------------------------- |
-| Lakeflow Connect            | Auto Loader ingestion           |
-| Spark Declarative Pipelines | streaming data transformation   |
-| Unity Catalog               | governance and access control   |
-| DevOps for Data Engineering | checkpoints and schema tracking |
-| Delta Lake                  | Bronze Delta tables             |
-
----
-
 # 14. Current Architecture
 
 The current pipeline architecture is:
