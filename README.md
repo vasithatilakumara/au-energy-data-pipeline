@@ -1,997 +1,207 @@
-# Project Summary - 12/03/2026
+# Energy Market Data Pipeline - Azure Databricks
 
-# Energy Market Data Pipeline – Databricks (Azure)
+> Production-grade data engineering pipeline for Australian electricity market analytics and battery dispatch optimisation
 
-## 1. Project Objective
-
-The goal of this project is to build a **production-style data engineering pipeline in Azure Databricks** that ingests electricity market data from the **Australian Energy Market Operator (AEMO)** and processes it through a **Bronze → Silver → Gold Medallion architecture**.
-
-The processed data will later support analytics such as:
-
-- electricity demand patterns
-- price spike detection
-- peak grid stress periods
-- battery charge/discharge optimization
-
-The project is also designed to practice the concepts required for the **Databricks Data Engineer certification**, including:
-
-- Lakeflow Connect (data ingestion)
-- Lakeflow Jobs (pipeline orchestration)
-- Spark Declarative Pipelines
-- DevOps best practices for data engineering
+![Azure Databricks](https://img.shields.io/badge/Azure%20Databricks-FF3621?style=flat&logo=databricks&logoColor=white)
+![Delta Lake](https://img.shields.io/badge/Delta%20Lake-003366?style=flat&logo=delta&logoColor=white)
+![Power BI](https://img.shields.io/badge/Power%20BI-F2C811?style=flat&logo=powerbi&logoColor=black)
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
+![PySpark](https://img.shields.io/badge/PySpark-E25A1C?style=flat&logo=apachespark&logoColor=white)
 
 ---
 
-# 2. Cloud Architecture Setup
+## Overview
 
-The project environment was built using **Azure Databricks integrated with Azure Data Lake Storage Gen2 (ADLS)**.
+This project builds a production-grade data engineering pipeline on Azure Databricks that ingests electricity market data from the Australian Energy Market Operator (AEMO) and processes it through a Bronze → Silver → Gold medallion architecture to answer a concrete business question: **when should a residential battery system charge the battery during low-price intervals and discharge stored energy back to the grid during high-value periods to maximise economic return?**
 
-The architecture follows a modern **Databricks Unity Catalog governance model**.
+Electricity prices in the NEM fluctuate dramatically across 5-minute settlement intervals — from near zero during oversupply to above $10,000/MWh during grid stress events. A battery system acting on stale or unstructured data leaves significant value on the table. This pipeline transforms raw AEMO dispatch data into a near real-time or batch-updated decision signal (with real-time extension planned), surfacing price spike detection, peak demand identification, and actionable charge/discharge recommendations through a Power BI dashboard connected to Databricks via SQL Warehouse.
 
-Pipeline architecture:
-
-```
-AEMO CSV Data
-        ↓
-Azure Data Lake Storage (ADLS Gen2)
-        ↓
-Unity Catalog External Location
-        ↓
-Databricks Auto Loader
-        ↓
-Bronze Delta Tables
-        ↓
-Silver Transformations
-        ↓
-Gold Analytics Tables
-```
+Built to demonstrate production data engineering practices aligned with the Databricks Data Engineer certification: automated incremental ingestion with Auto Loader, governed storage access via Unity Catalog, orchestrated multi-task pipeline execution with Lakeflow Jobs, and environment-separated DevOps configuration across dev and prod schemas.
 
 ---
 
-# 3. Azure Infrastructure Configuration
-
-## Storage Account
-
-Created an ADLS Gen2 storage account:
+## Architecture
 
 ```
-energyau2026vtk
+AEMO CSV  →  ADLS Gen2  →  Bronze  →  Silver  →  Gold  →  Power BI
 ```
 
-Container:
-
-```
-energyau2026
-```
-
-Storage structure:
-
-```
-energyau2026
-│
-├── landing
-│     ├── price_and_demand
-│     ├── operational_demand
-│     └── public_prices
-│
-├── checkpoints
-│
-└── schemas
-```
-
-Purpose of each folder:
-
-| Folder      | Purpose                     |
-| ----------- | --------------------------- |
-| landing     | raw ingestion files         |
-| checkpoints | streaming checkpoint state  |
-| schemas     | Auto Loader schema tracking |
+![Architecture Diagram](assets/architecture.png)
 
 ---
 
-# 4. Unity Catalog Governance Setup
+## Pipeline design
 
-The Databricks workspace was upgraded to **Premium** to enable **Unity Catalog**.
+The pipeline follows a medallion architecture across three layers, each with a distinct contract around data quality and purpose. Raw data is never modified — each layer transforms and enriches the previous one, with invalid records quarantined rather than dropped silently.
 
-Unity Catalog objects were created to securely manage storage access.
+### Bronze — raw ingestion
 
-## Storage Credential
+Ingested via Databricks Auto Loader reading AEMO `PRICE_AND_DEMAND` CSV files from the ADLS Gen2 landing zone. The Bronze table is append-only and stores data exactly as it arrives — no type casting, no filtering, no transformations. Schema is inferred and tracked automatically by Auto Loader, with file lineage captured via `_metadata.file_path` (Unity Catalog's replacement for `input_file_name()`). Streaming checkpoints ensure exactly-once processing and allow the pipeline to resume from the last processed file without reingesting historical data.
 
-A **Storage Credential** was created using an **Azure Managed Identity (Access Connector)**.
+**Table:** `main.energyau_dev_bronze.price_and_demand`
 
-This replaced the older authentication method:
+| Column | Description |
+|---|---|
+| `REGION` | Market region (VIC1, NSW1, etc.) |
+| `SETTLEMENTDATE` | Settlement interval timestamp (kept as string in Bronze) |
+| `TOTALDEMAND` | Electricity demand in MW |
+| `RRP` | Regional reference price |
+| `PERIODTYPE` | Market period classification |
+| `source_file` | Source file path for lineage |
+| `ingested_at` | Ingestion timestamp |
 
-```
-spark.conf.set(storage_key)
-```
+The model uses Regional Reference Price (RRP) as a proxy for export value, acknowledging that actual household feed-in tariffs may differ depending on retailer arrangements.
 
-Modern authentication architecture:
+### Silver — cleaned and validated
 
-```
-Databricks Access Connector
-        ↓
-Storage Credential
-        ↓
-External Location
-        ↓
-ADLS Storage
-```
+Transforms raw Bronze data into a typed, deduplicated, quality-assured dataset suitable for analytics. Transformations applied in this layer:
 
----
+- `SETTLEMENTDATE` parsed from string to timestamp with consistent formatting
+- Time attributes derived: `year`, `month`, `day`, `hour` for efficient downstream aggregation
+- Columns renamed to `snake_case` (e.g. `TOTALDEMAND` → `total_demand_mw`)
+- Explicit type casting enforced: demand and price cast to `double`, timestamp to `timestamp`
+- Null checks, range validation (`demand >= 0`), and duplicate removal applied
 
-## External Location
+Invalid records are not dropped — they are written to `silver_rejects.price_and_demand` for debugging and auditability. The Silver table is the trusted source for all downstream Gold tables.
 
-An external location was created to map the storage container to Unity Catalog.
+**Table:** `main.energyau_dev_silver.price_and_demand`
 
-Example path:
+### Gold — business logic and analytics
 
-```
-abfss://energyau2026@energyau2026vtk.dfs.core.windows.net/
-```
+Four purpose-built tables, each answering a specific operational question. The Gold layer is designed around decisions, not aggregations — every table exists because it drives a distinct action or insight.
 
-The external location allows Databricks to securely read and write data in ADLS.
+| Table | Question it answers |
+|---|---|
+| `gold_price_signals` | When are prices high or spiking? |
+| `gold_demand_signals` | When is the grid under peak stress? |
+| `gold_battery_actions` | Should the battery charge, discharge, or idle right now? |
+| `gold_market_summary` | What are the overall market trends for reporting? |
 
----
+The central output is `gold_battery_actions`, which combines price percentile ranking and demand spike flags to emit a `CHARGE_BATTERY`, `DISCHARGE_TO_GRID`, or `IDLE` recommendation for each 5-minute interval. Price signals and demand signals are kept as separate tables because the two measures decouple — price spikes driven by generation shortfalls occur independently of demand peaks, and a battery optimisation strategy needs to act on both patterns distinctly. In the context of grid export optimisation, price acts as the primary revenue signal for discharge decisions, while demand is used as a proxy for grid stress events that often precede extreme price spikes.
 
-# 5. Azure IAM Configuration
-
-To enable Auto Loader and Unity Catalog access, the Databricks Access Connector was granted the following Azure roles:
-
-| Role                                    | Purpose                              |
-| --------------------------------------- | ------------------------------------ |
-| Storage Blob Data Contributor           | read/write ADLS files                |
-| Storage Queue Data Contributor          | create queues for file notifications |
-| EventGrid EventSubscription Contributor | create event grid subscriptions      |
-| Storage Account Contributor             | manage storage resources             |
-
-These permissions enable Databricks to integrate with Azure storage services.
+**Consumed by:** Power BI semantic model via Databricks SQL Warehouse
 
 ---
 
-# 6. Bronze Ingestion Pipeline
+## Dashboard & results
 
-A streaming ingestion pipeline was implemented using **Databricks Auto Loader**.
+The Power BI dashboard connects directly to the `gold_battery_actions` table in Databricks via SQL Warehouse, translating raw 5-minute dispatch interval data into operational insights for residential battery management.
 
-Auto Loader reads files from the **landing zone** and loads them into a **Delta Lake Bronze table**.
+![Energy Demand Dashboard](assets/visualisation.png)
 
-Data source:
+### What the dashboard shows
 
-```
-AEMO PRICE_AND_DEMAND CSV files
-```
+Three visualisations cover the core analytical questions:
 
-Example fields:
+**Regional reference price by date** tracks electricity price across every 5-minute settlement interval from January to April 2025 in the VIC1 region. The chart makes price volatility immediately visible — the baseline sits near zero for the majority of intervals, with sharp vertical spikes reaching above $10,000/MWh during high-stress events. These spikes are the primary signal the battery dispatch logic acts on.
 
-| Column         | Description                   |
-| -------------- | ----------------------------- |
-| REGION         | market region (VIC1, NSW1)    |
-| SETTLEMENTDATE | settlement interval timestamp |
-| TOTALDEMAND    | electricity demand (MW)       |
-| RRP            | regional reference price      |
-| PERIODTYPE     | market period classification  |
+**Total demand (MW) by date** shows aggregate grid demand across the same period. The cyclical pattern reflects real consumption behaviour — weekday morning and evening peaks, lower weekend demand, and a gradual demand taper through autumn as heating load decreases.
 
----
+**Price vs demand overlay** is the most analytically valuable panel. Plotted on dual axes, it surfaces the core insight driving the battery optimisation logic: demand spikes and price spikes are correlated but not identical. There are intervals where demand is elevated but price remains moderate, and — more importantly — intervals where price spikes sharply with only modest demand increases. These decoupled events, driven by generation shortfalls or interconnector constraints rather than raw consumption, represent the highest-value discharge opportunities for a battery system.
 
-# 7. Auto Loader Configuration
+### Key insight
 
-The ingestion notebook configures Auto Loader using **cloudFiles**.
+Peak demand and peak price move together most of the time, but the exceptions are where battery value is created. A battery dispatching purely on demand signals would miss the price-driven spikes that occur independently of consumption load. The pipeline's Gold layer separates these two signals — `gold_price_signals` and `gold_demand_signals` as distinct tables — precisely to capture both patterns and combine them in the `gold_battery_actions` dispatch recommendation.
 
-Important configuration settings:
+### Data coverage
 
-| Option                      | Purpose                           |
-| --------------------------- | --------------------------------- |
-| cloudFiles.format           | specify CSV format                |
-| cloudFiles.schemaLocation   | store inferred schema             |
-| cloudFiles.useNotifications | disabled (directory listing mode) |
-| checkpointLocation          | track processed files             |
-
-Since file notification provisioning failed, the pipeline currently runs using:
-
-```
-directory listing mode
-```
-
-instead of Event Grid.
+| Attribute | Value |
+|---|---|
+| Region | VIC1 (Victoria) |
+| Period | January — April 2025 |
+| Granularity | 5-minute settlement intervals |
+| Source | AEMO PRICE_AND_DEMAND |
+| Refresh | Static snapshot (DirectQuery planned) |
 
 ---
 
-# 8. Bronze Table Design
+## Key engineering decisions
 
-The Bronze table captures raw ingestion data with minimal transformations.
+These are the non-obvious choices made during development - decisions where the obvious path didn't work or wasn't the right fit, and why the alternatives were chosen instead.
 
-Example table:
+### `_metadata.file_path` instead of `input_file_name()`
 
-```
-energyau_2026.bronze.price_and_demand
-```
+The Bronze ingestion notebook originally used `input_file_name()` to capture the source file path for data lineage. Unity Catalog does not permit this function — it raises an `AnalysisException` at runtime. The workaround is to use the `_metadata.file_path` column exposed by Auto Loader's internal metadata struct, which Unity Catalog allows and which provides the same information: the full ADLS path of the file that produced each row. This column is aliased to `source_file` on write and serves as the lineage anchor for debugging and auditability across all downstream layers.
 
-Columns:
+**Why it matters:** This is a Unity Catalog-specific constraint that isn't documented prominently. Hitting it in production and resolving it without falling back to legacy authentication is a meaningful signal that the pipeline is genuinely governed rather than just technically functional.
 
-| Column         | Purpose             |
-| -------------- | ------------------- |
-| REGION         | market region       |
-| SETTLEMENTDATE | kept as string      |
-| TOTALDEMAND    | electricity demand  |
-| RRP            | electricity price   |
-| PERIODTYPE     | market period type  |
-| source\_file   | source file path    |
-| ingested\_at   | ingestion timestamp |
+### Gold layer redesigned around business questions, not aggregation types
 
----
+The initial Gold layer produced multiple tables that overlapped significantly — hourly aggregates, daily aggregates, and regional summaries that largely duplicated each other with different time windows. The layer was refactored entirely around the question: *what decision does this table support?*
 
-# 9. Unity Catalog Metadata Handling
+The result is four tables with non-overlapping purposes: price spike detection, demand peak identification, battery dispatch recommendations, and market summary reporting. Each table exists because it answers a question that no other table answers. The price and demand signal tables are kept separate — rather than joined — because the two measures decouple in practice. Price spikes driven by generation shortfalls occur independently of demand peaks, and a battery system needs to act on each pattern distinctly.
 
-Unity Catalog does not allow the function:
+**Why it matters:** Most pipeline tutorials produce Gold tables that are just aggregated Silver. Organising Gold around business questions forces clarity about what the pipeline is actually for, and produces a data model that stakeholders can reason about without understanding the underlying pipeline logic.
 
-```
-input_file_name()
-```
+### `trigger(availableNow=True)` over continuous streaming
 
-Instead, ingestion metadata is captured using:
+Auto Loader supports two trigger modes: continuous streaming, which processes records as they arrive, and `trigger(availableNow=True)`, which processes all currently available files then stops. The pipeline uses the latter, scheduled via Lakeflow Jobs on a fixed cadence.
 
-```
-_metadata.file_path
-```
+The choice was deliberate. The source data — AEMO dispatch files — arrives in discrete file drops rather than as a true stream. Continuous streaming would keep a cluster alive between file arrivals, burning compute for no throughput gain. `trigger(availableNow=True)` processes each file drop completely, checkpoints progress, and terminates — making it cost-efficient while preserving all the incremental ingestion guarantees of Structured Streaming: exactly-once processing, schema tracking, and checkpoint-based resumption.
 
-This column records the source file path for data lineage and debugging.
+**Why it matters:** The distinction between trigger modes is a common exam and interview topic. Choosing `availableNow` over continuous streaming demonstrates cost awareness alongside technical correctness — a signal that the pipeline was designed for production operation, not just to run.
 
----
+### Directory listing mode over Event Grid notifications
 
-# 10. Streaming Execution Mode
+Auto Loader supports two file discovery mechanisms: directory listing, which polls the landing zone for new files, and file notification mode, which uses Azure Event Grid to push notifications when files arrive. The pipeline runs in directory listing mode because Event Grid subscription provisioning failed during setup due to insufficient IAM permissions on the subscription scope.
 
-The ingestion pipeline uses:
+Rather than blocking on a permissions escalation, the pipeline was reconfigured to use directory listing with an appropriate polling interval. For the current data volume and ingestion cadence this is functionally equivalent — the latency difference between push and poll notification is immaterial when files arrive on a scheduled basis rather than continuously.
 
-```
-trigger(availableNow=True)
-```
+**Why it matters:** Documenting this openly is more credible than pretending it didn't happen. In production, the preference would be Event Grid for lower latency and reduced API call overhead — and enabling it requires granting the Databricks Access Connector the `EventGrid EventSubscription Contributor` role at the storage account scope.
 
-This runs Auto Loader in **triggered batch mode**.
+### Environment separation via schema naming rather than separate catalogs
 
-Execution behavior:
+Unity Catalog's free tier constrains catalog creation. Rather than provisioning separate `dev` and `prod` catalogs, the pipeline implements environment separation through schema naming conventions within the `main` catalog: `energyau_dev_bronze`, `energyau_dev_silver`, `energyau_dev_gold` for development, with equivalent `energyau_prod_*` schemas for production promotion.
 
-```
-Start pipeline
-      ↓
-Process all available files
-      ↓
-Write to Delta table
-      ↓
-Stop automatically
-```
+Environment is controlled via a Databricks widget parameter passed through the Lakeflow Job at runtime, resolved in the centralised `/config/config` notebook to produce fully-qualified table references. The same notebook code runs in both environments without modification.
 
-This mode is commonly used in production pipelines orchestrated by scheduled jobs.
+**Why it matters:** This is a pragmatic production pattern when full catalog separation isn't available. It demonstrates understanding of the underlying goal — environment isolation — and the ability to achieve it within real infrastructure constraints rather than assuming ideal conditions.
 
 ---
 
-# 11. Current Pipeline State
+## Tech stack
 
-The system now successfully performs:
-
-```
-ADLS landing
-     ↓
-Auto Loader
-     ↓
-Bronze Delta Table
-```
-
-The pipeline supports:
-
-- incremental ingestion
-- schema tracking
-- file lineage
-- streaming checkpoints
+| Layer | Technology |
+|---|---|
+| Cloud platform | Microsoft Azure |
+| Compute | Azure Databricks (Premium) |
+| Storage | Azure Data Lake Storage Gen2 |
+| Table format | Delta Lake |
+| Governance | Unity Catalog |
+| Ingestion | Databricks Auto Loader |
+| Orchestration | Lakeflow Jobs |
+| Authentication | Azure Managed Identity (Access Connector) |
+| Visualisation | Power BI (SQL Warehouse connection) |
+| Language | Python / PySpark |
 
 ---
 
-# 14. Current Architecture
-
-The current pipeline architecture is:
+## Repo structure
 
 ```
-AEMO CSV Files
-        ↓
-ADLS Landing Zone
-        ↓
-Unity Catalog External Location
-        ↓
-Databricks Auto Loader
-        ↓
-Bronze Delta Table
-```
-
-# Project Summary - 30/03/2026
-
-# 12. Silver Layer – Data Transformation & Quality
-
-The Silver layer transforms raw Bronze data into **clean, structured, and reliable datasets** suitable for analytics.
-
-This stage focuses on:
-
-- data standardisation
-- type enforcement
-- enrichment
-- data quality validation
-
-Pipeline flow:
-
-```
-bronze.price_and_demand
-        ↓
-data parsing & cleaning
-        ↓
-validation rules applied
-        ↓
-silver.price_and_demand
+├── config/
+│   ├── config.py          # environment / table references
+│   └── init.py            # schema creation
+├── ingestion/
+│   └── bronze_autoloader.py
+├── transformation/
+│   ├── silver_transform.py
+│   └── gold_tables.py
+├── validation/
+│   ├── validate_bronze.py
+│   └── validate_silver.py
+├── docs/
+│   ├── architecture.png
+│   └── dashboard.png
+└── README.md
 ```
 
 ---
 
-## 13. Silver Transformation Logic
-
-The following transformations were applied:
-
-### Timestamp Parsing
-
-- Converted `SETTLEMENTDATE` from string → timestamp
-- Ensured consistent time format across all records
-
----
-
-### Derived Time Attributes
-
-Additional analytical fields were created:
-
-- year
-- month
-- day
-- hour
-
-These fields enable efficient aggregation in the Gold layer.
-
----
-
-### Column Standardisation
-
-- Renamed columns to consistent naming convention:
-  - lowercase
-  - snake\_case
-
-Example:
-
-```
-TOTALDEMAND → total_demand_mw
-```
-
----
-
-### Data Type Enforcement
-
-Explicit casting applied to ensure consistency:
-
-- demand → double
-- price → double
-- timestamp → timestamp
-
-This prevents downstream schema inconsistencies.
-
----
-
-## 14. Data Quality Validation (Silver Layer)
-
-Data quality checks were introduced to ensure reliability.
-
-Validation rules:
-
-| Rule               | Description                      |
-| ------------------ | -------------------------------- |
-| Null check         | critical fields must not be null |
-| Range check        | demand must be ≥ 0               |
-| Duplicate check    | remove duplicate records         |
-| Schema consistency | enforce correct data types       |
-
----
-
-## 15. Invalid Data Handling
-
-Invalid records are separated into a dedicated table:
-
-```
-silver_rejects.price_and_demand
-```
-
-This enables:
-
-- debugging
-- monitoring data issues
-- auditability
-
----
-
-## 16. Silver Table Output
-
-Cleaned data is written to:
-
-```
-main.energyau_dev_silver.price_and_demand
-```
-
-This table serves as the **trusted source** for downstream analytics.
-
----
-
-# 17. Gold Layer – Business-Level Data Transformation
-
-The Gold layer transforms Silver data into **analytics-ready datasets aligned with business use cases**.
-
-Unlike Bronze and Silver, the Gold layer is designed around:
-
-```
-decision-making
-```
-
----
-
-## 18. Gold Layer Design Principles
-
-The Gold layer was redesigned to avoid redundancy and ensure each table serves a **distinct business purpose**.
-
-Each table answers a specific question:
-
-- When are electricity prices high?
-- When is the grid under stress?
-- What action should a battery system take?
-- What are the overall trends?
-
----
-
-## 19. Gold Tables Implemented
-
-### 1. Price Signals Table
-
-```
-gold_price_signals
-```
-
-Purpose:
-
-- identify high-price intervals
-- detect price spikes
-
-Contains:
-
-- timestamp
-- region
-- rrp
-- price percentile
-- spike flag
-
----
-
-### 2. Demand Signals Table
-
-```
-gold_demand_signals
-```
-
-Purpose:
-
-- detect peak demand periods
-- identify grid stress
-
-Contains:
-
-- timestamp
-- total demand
-- demand percentile
-- ramp changes
-- peak demand flag
-
----
-
-### 3. Battery Decision Table (Core Output)
-
-```
-gold_battery_actions
-```
-
-Purpose:
-
-- provide actionable insights for battery optimisation
-
-Contains:
-
-- timestamp
-- region
-- price
-- demand
-- spike indicators
-- recommended action:
-  - CHARGE
-  - DISCHARGE
-  - IDLE
-
-This table represents the **final business outcome of the pipeline**.
-
----
-
-### 4. Market Summary Table
-
-```
-gold_market_summary
-```
-
-Purpose:
-
-- support dashboard visualisation
-
-Contains:
-
-- time-based aggregations
-- average price
-- peak price
-- average demand
-- spike counts
-
----
-
-# 20. Removal of Redundant Gold Tables
-
-Initially, multiple Gold tables produced overlapping insights.
-
-These were refactored to:
-
-- eliminate duplication
-- align each table with a clear business use case
-- improve clarity for stakeholders
-
----
-
-# 21. Job Orchestration – Lakeflow Jobs
-
-The pipeline is orchestrated using **Databricks Lakeflow Jobs**, enabling automated and reliable execution.
-
----
-
-## Job Structure
-
-```
-Task 0 → init_environment
-Task 1 → bronze_ingestion
-Task 2 → validate_bronze
-Task 3 → silver_transformation
-Task 4 → validate_silver
-Task 5 → gold_transformation
-```
-
----
-
-## Features Implemented
-
-- task dependencies
-- retry logic
-- parameter passing (ENV)
-- scheduled execution
-- failure handling
-
----
-
-# 22. Data Validation & Completion Checks
-
-Validation steps were added to ensure data integrity at each stage.
-
----
-
-## Bronze Validation
-
-- ensure data ingestion completed
-- verify row count > 0
-
----
-
-## Silver Validation
-
-- ensure no null values in critical fields
-- verify data quality rules applied
-
----
-
-## Completion Checks
-
-Pipeline enforces:
-
-```
-fail fast if data is invalid
-```
-
-This prevents bad data from propagating downstream.
-
----
-
-# 23. DevOps Implementation
-
-The pipeline was enhanced with DevOps best practices to ensure scalability and maintainability.
-
----
-
-## Centralized Configuration
-
-A reusable configuration notebook was created:
-
-```
-/config/config
-```
-
-Handles:
-
-- environment (dev/prod)
-- table naming
-- schema references
-
----
-
-## Environment Parameterization
-
-Used widgets to dynamically control environment:
-
-```
-dev → prod
-```
-
-Same codebase runs across environments without modification.
-
----
-
-## Initialization Layer (Infrastructure Setup)
-
-A dedicated initialization notebook was implemented:
-
-```
-/config/init
-```
-
-Responsibilities:
-
-- create schemas if not exists
-- standardize environment setup
-
----
-
-## Schema Strategy
-
-Due to Unity Catalog storage limitations:
-
-- used `main` catalog
-- implemented environment-based schema separation
-
-Example:
-
-```
-main.energyau_dev_bronze
-main.energyau_dev_silver
-main.energyau_dev_gold
-```
-
----
-
-## Modular Notebook Design
-
-Pipeline split into reusable components:
-
-- ingestion
-- transformation
-- validation
-- analytics
-
----
-
-# 24. Current Pipeline State
-
-The system now performs:
-
-```
-ADLS Landing
-     ↓
-Bronze Ingestion
-     ↓
-Silver Transformation + Validation
-     ↓
-Gold Business Tables
-     ↓
-Job Orchestration
-```
-
-# 25. Gold Layer – Analytics Output & Dashboard Integration
-
-The Gold layer outputs are designed to serve as the **single source of truth for business intelligence and dashboarding**.
-
-These tables are consumed directly by **Power BI** to enable:
-
-- real-time decision support
-- interactive analysis
-- stakeholder reporting
-
-Pipeline flow:
-
-```
-silver.price_and_demand
-        ↓
-gold transformations
-        ↓
-gold tables (analytics-ready)
-        ↓
-Power BI dashboard
-```
-
----
-
-## 26. Semantic Modelling (Power BI Layer)
-
-To support scalable and structured analytics, a **semantic model** was implemented in Power BI.
-
-This layer translates raw data into **business-readable insights**.
-
----
-
-### Model Structure (Star Schema)
-
-The model follows a **star schema design**:
-
-```
-           dim_date
-              |
-              |
-dim_region — fact_battery_dispatch — other fact tables
-```
-
----
-
-### Fact Table (Central Table)
-
-```
-fact_battery_dispatch
-```
-
-Represents:
-
-- energy market events at each timestamp
-
-Contains:
-
-- timestamp
-- region
-- price (rrp)
-- demand
-- action (charge/discharge/hold)
-
-This serves as the **core analytical dataset**.
-
----
-
-### Dimension Tables
-
-### Date Dimension
-
-```
-dim_date
-```
-
-Provides time-based context:
-
-- date
-- year
-- month
-- hour
-
-Enables:
-
-- time-based filtering
-- trend analysis
-- aggregation
-
----
-
-### Region Dimension
-
-```
-dim_region
-```
-
-Provides geographic context:
-
-- region
-
-Enables:
-
-- regional filtering
-- comparison across markets
-
----
-
-## 27. Relationship Design
-
-Relationships were defined to ensure **consistent filtering and performance optimisation**.
-
-| From (Fact) | To (Dimension) |
-| ----------- | -------------- |
-| timestamp   | dim\_date      |
-| region      | dim\_region    |
-
-Configuration:
-
-- cardinality: many-to-one (\*:1)
-- filter direction: single
-
-This ensures:
-
-- controlled filtering
-- efficient query execution
-
----
-
-## 28. Handling Multiple Fact Tables
-
-Additional Gold tables:
-
-- price signals
-- demand signals
-- market summary
-
-These were integrated into the model using **shared dimension tables** instead of direct joins.
-
-This avoids:
-
-- ambiguous relationships
-- incorrect aggregations
-- model complexity
-
----
-
-## 29. Measures (Business Calculations)
-
-Key business metrics were implemented using DAX measures.
-
-Examples:
-
-- average price
-- peak demand
-- spike count
-- latest battery action
-
-These measures provide:
-
-- dynamic calculations
-- reusable logic
-- consistent reporting
-
----
-
-## 30. Dashboard Design Principles
-
-The dashboard was designed to support **decision-making rather than data exploration**.
-
----
-
-### Key Design Goals
-
-- clarity over complexity
-- minimal but meaningful visuals
-- actionable insights
-
----
-
-### Dashboard Structure
-
-### Executive Summary
-
-- average price
-- peak price
-- demand indicators
-- current battery action
-
----
-
-### Price vs Demand Analysis
-
-- trend of price and demand over time
-- identification of price spikes
-
----
-
-### Grid Stress & Peak Detection
-
-- high-demand intervals
-- stress periods
-
----
-
-### Battery Decision Insights
-
-- recommended action (charge/discharge/hold)
-- based on price signals
-
----
-
-## 31. Dashboard Connectivity
-
-Power BI was connected to Databricks using:
-
-- SQL Warehouse
-- personal access token (PAT) authentication
-
-For portfolio deployment:
-
-- switched to **Import mode**
-- ensured dataset is self-contained
-- removed dependency on live connection
-
----
-
-## 32. Data Refresh Strategy
-
-For production scenarios:
-
-- DirectQuery or scheduled refresh would be used
-
-For this project:
-
-- static snapshot used for stability
-- ensures consistent behaviour when published
-
----
-
-## 33. Dashboard Deployment
-
-The dashboard was published using:
-
-```
-Power BI Service → Publish to Web
-```
-
-This enables:
-
-- public access
-- embedding in portfolio
-- sharing via link
-
----
-
-## 34. Final Architecture (End-to-End)
-
-The complete pipeline now operates as:
-
-```
-AEMO Data (CSV)
-     ↓
-ADLS Gen2 (Landing)
-     ↓
-Bronze (Raw Ingestion)
-     ↓
-Silver (Clean + Validated)
-     ↓
-Gold (Business Logic Tables)
-     ↓
-Power BI Semantic Model
-     ↓
-Interactive Dashboard
-```
-
----
-
-## 35. Key Outcome
-
-The system delivers:
-
-- structured energy market analytics
-- detection of price and demand patterns
-- actionable battery optimisation insights
-
-Most importantly:
-
-```
-Transforms raw energy data into decision-ready intelligence
-```
-
-The dashboard layout:
-![Project Screenshot](assets/visualisation.png)
-
+## Roadmap
+
+- [ ] Real-time ingestion via Open Electricity API with `trigger(processingTime="5 minutes")`
+- [ ] XGBoost battery action classifier with MLflow experiment tracking
+- [ ] Multi-region expansion (VIC1, NSW1, QLD1, SA1, TAS1)
+- [ ] Event Grid file notification mode (requires `EventGrid EventSubscription Contributor` IAM role)
+- [ ] DirectQuery connection replacing static Power BI snapshot
